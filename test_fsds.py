@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
 import rospy, csv, math, bisect, numpy as np
 from collections import deque
-from sensor_msgs.msg import NavSatFix
+from sensor_msgs.msg import NavSatFix, Image, PointCloud2, Imu
 from geometry_msgs.msg import TwistWithCovarianceStamped, PoseStamped
 from fs_msgs.msg import ControlCommand
 from visualization_msgs.msg import Marker, MarkerArray
-from std_msgs.msg import Header
+from std_msgs.msg import Header, Bool, String
+import cv2
+from cv_bridge import CvBridge
+
+class ASStatus:
+    OFF = "AS_Off"
+    READY = "AS_Ready"
+    DRIVING = "AS_Driving"
+    EMERGENCY = "AS_Emergency"
+    FINISHED = "AS_Finished"
 
 class ADSControllerPurePursuit:
     def __init__(self):
@@ -46,35 +55,69 @@ class ADSControllerPurePursuit:
         self.prev_time   = rospy.Time.now().to_sec()
 
         self.track_data  = []
+        self.cv_bridge = CvBridge()
+        
+        self.left_camera = None
+        self.mid_camera = None
+        self.right_camera = None
+        
+        self.lidar_data = None
+        
+        self.imu_data = None
+        self.angular_velocity = None
+        self.linear_acceleration = None
 
-        # Subscribers
+        self.state = ASStatus.OFF
+        self.emergency = False
+        self.go_signal = False
+        self.mission_finished = False
+
+        rospy.Subscriber('/fsds/camera_left', Image, self.left_camera_cb)
+        rospy.Subscriber('/fsds/camera_mid', Image, self.mid_camera_cb)
+        rospy.Subscriber('/fsds/camera_right', Image, self.right_camera_cb)
+        rospy.Subscriber('/fsds/lidar/lidar1', PointCloud2, self.lidar_cb)
         rospy.Subscriber('/fsds/gps', NavSatFix, self.gps_cb)
-        rospy.Subscriber('/fsds/gss', TwistWithCovarianceStamped, self.speed_cb)
+        rospy.Subscriber('/fsds/imu', Imu, self.imu_cb)
 
-        # Publishers
-        self.ctrl_pub     = rospy.Publisher('/fsds/control_command', ControlCommand, queue_size=1)
         self.pose_pub     = rospy.Publisher('/current_pose', PoseStamped, queue_size=1)
         self.direction_pub= rospy.Publisher('/midline_direction_markers', MarkerArray, queue_size=1)
+        self.ctrl_pub = rospy.Publisher('/fsds/control_command', ControlCommand, queue_size=1)
 
-        self.load_and_preprocess_path()
+        self.state = ASStatus.READY
 
         rospy.spin()
 
+    # 규정에 맞는 센서 콜백 함수들
+    def left_camera_cb(self, msg):
+        try:
+            self.left_camera = self.cv_bridge.imgmsg_to_cv2(msg, "bgr8")
+            rospy.loginfo("Left camera received")
+        except Exception as e:
+            rospy.logwarn(f"Left camera processing error: {e}")
 
-    def load_and_preprocess_path(self):
-        with open(self.csv_path, newline='') as cf:
-            rdr = csv.DictReader(cf)
-            last = None
-            for r in rdr:
-                pt = (float(r['latitude']), float(r['longitude']))
-                if pt != last:
-                    self.latlon_path.append(pt)
-                    last = pt
+    def mid_camera_cb(self, msg):
+        try:
+            self.mid_camera = self.cv_bridge.imgmsg_to_cv2(msg, "bgr8")
+            rospy.loginfo("Mid camera received")
+        except Exception as e:
+            rospy.logwarn(f"Mid camera processing error: {e}")
 
-        self.latlon_path = self.resample(self.latlon_path, self.resample_dist)
-        if self.smoothing_enabled and self.smoothing_window > 1:
-            self.latlon_path = self.smooth(self.latlon_path, self.smoothing_window)
+    def right_camera_cb(self, msg):
+        try:
+            self.right_camera = self.cv_bridge.imgmsg_to_cv2(msg, "bgr8")
+            rospy.loginfo("Right camera received")
+        except Exception as e:
+            rospy.logwarn(f"Right camera processing error: {e}")
 
+    def lidar_cb(self, msg):
+        self.lidar_data = msg
+        rospy.loginfo("LiDAR received")
+
+    def imu_cb(self, msg):
+        self.imu_data = msg
+        self.angular_velocity = msg.angular_velocity
+        self.linear_acceleration = msg.linear_acceleration
+        rospy.loginfo("IMU received")
 
     def resample(self, pts, interval):
         R = 6378137.0
@@ -110,7 +153,6 @@ class ADSControllerPurePursuit:
             ))
         return out
 
-
     def smooth(self, path, window):
         half = window // 2
         sm = []
@@ -123,7 +165,6 @@ class ADSControllerPurePursuit:
             avg1 = sum(p[1] for p in seg)/len(seg)
             sm.append((avg0, avg1))
         return sm
-
 
     def gps_cb(self, msg):
         lat, lon = msg.latitude, msg.longitude
@@ -144,14 +185,16 @@ class ADSControllerPurePursuit:
             dy = self.pos_hist[1][1] - self.pos_hist[0][1]
             self.yaw = math.atan2(dy, dx)
 
-        self.control()
-        self.publish_direction_markers()
+        # 규정에 맞는 제어 로직 실행
+        if self.state == ASStatus.DRIVING and not self.emergency:
+            self.control()
+            self.publish_direction_markers()
 
+        rospy.loginfo("GPS received")
 
     def speed_cb(self, msg):
         vx, vy = msg.twist.twist.linear.x, msg.twist.twist.linear.y
         self.current_speed = math.hypot(vx, vy)
-
 
     def latlon_to_enu(self, pts, ref):
         R = 6378137.0
@@ -163,8 +206,10 @@ class ADSControllerPurePursuit:
             out.append((dn, de))
         return out
 
-
     def find_target(self):
+        if not self.enu_path or self.position is None:
+            return None, None
+            
         Ld = self.L_base + self.L_gain * self.current_speed
         idx = int(np.argmin([
             math.hypot(self.position[0]-x, self.position[1]-y)
@@ -179,7 +224,6 @@ class ADSControllerPurePursuit:
                 return x1, y1
         return self.enu_path[-1]
 
-
     def control(self):
         if self.position is None or self.yaw is None:
             return
@@ -191,7 +235,7 @@ class ADSControllerPurePursuit:
 
         Ld = math.hypot(dx, dy)
         th = math.atan2(2*self.wheel_base*math.sin(ang), Ld)
-        raw_steer = max(min(th,1.0), -1.0)
+        raw_steer = max(min(th, 1.0), -1.0)
 
         steer_cmd = (
             self.steer_smooth * self.prev_steer
@@ -207,15 +251,15 @@ class ADSControllerPurePursuit:
         deriv = (err - self.prev_error) / dt
         self.prev_error = err
         out = self.kp*err + self.ki*self.acc_error + self.kd*deriv
-        thr_cmd = max(min(out,1.0), 0.0)
+        thr_cmd = max(min(out, 1.0), 0.0)
 
         cmd = ControlCommand()
         cmd.header.stamp = rospy.Time.now()
-        cmd.steering    = steer_cmd
-        cmd.throttle    = thr_cmd
-        cmd.brake       = 0.0
+        cmd.steering = steer_cmd
+        cmd.throttle = thr_cmd
+        cmd.brake = 0.0
         self.ctrl_pub.publish(cmd)
-    
+
     def publish_direction_markers(self):
         if self.position is None or self.yaw is None:
             return
@@ -266,7 +310,6 @@ class ADSControllerPurePursuit:
             marker_array.markers.append(m)
 
         self.direction_pub.publish(marker_array)
-
 
 if __name__ == '__main__':
     try:
